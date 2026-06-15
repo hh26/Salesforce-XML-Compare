@@ -67,7 +67,9 @@ const PermissionSetDiff = () => {
   const [pasteB, setPasteB] = useState('');
   
   const [diffResults, setDiffResults] = useState([]);
-  const [showUnchanged, setShowUnchanged] = useState(false);
+  
+  const [showOnlyDifferences, setShowOnlyDifferences] = useState(false);
+  
   const [editingBlock, setEditingBlock] = useState({ idx: null, side: null });
 
   const historyRef = useRef([]);
@@ -316,8 +318,8 @@ const PermissionSetDiff = () => {
   };
 
   const totalChanges = diffResults.filter(d => d.status !== 'Unchanged').length;
-  const unchangedCount = diffResults.filter(d => d.status === 'Unchanged').length;
-  const displayedResults = showUnchanged ? diffResults : diffResults.filter(r => r.status !== 'Unchanged');
+  
+  const displayedResults = showOnlyDifferences ? diffResults.filter(r => r.status !== 'Unchanged') : diffResults;
 
   return (
     <div className="min-h-screen bg-[#111111] p-4 md:p-8 font-sans text-[#d4d4d4]">
@@ -325,8 +327,7 @@ const PermissionSetDiff = () => {
         
         {/* HEADER */}
         <div className="bg-[#252526] p-4 md:p-6 text-white text-center flex justify-center items-center gap-4 border-b border-gray-800">
-          <h1 className="text-xl md:text-2xl font-bold tracking-wide">Salesforce XML Merge Engine</h1>
-          <span className="bg-[#1e1e1e] px-3 py-1 text-xs rounded-full border border-gray-700 text-gray-300 shadow-inner">Ctrl + Z to Undo</span>
+          <h1 className="text-xl md:text-2xl font-bold tracking-wide">Salesforce XML Compare Tool</h1>
         </div>
 
         {/* UPLOAD SECTION */}
@@ -376,11 +377,12 @@ const PermissionSetDiff = () => {
           </div>
         </div>
 
-        {/* COMPARE BUTTON */}
-        <div className="text-center bg-[#1e1e1e] pb-8 border-b border-gray-800">
+        {/* COMPARE BUTTON & UNDO HINT */}
+        <div className="text-center bg-[#1e1e1e] pb-8 border-b border-gray-800 flex flex-col items-center gap-3">
           <button onClick={handleCompare} className="bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 px-12 rounded transition shadow-lg text-lg border border-blue-500 tracking-wide">
             Compare & Merge
           </button>
+          <span className="text-gray-500 text-xs tracking-wide">⌨️ Pro Tip: Use <kbd className="bg-[#252526] border border-gray-700 px-1.5 py-0.5 rounded text-gray-300 shadow-sm">Ctrl + Z</kbd> to Undo any merge action</span>
         </div>
 
         {/* DIFF VIEWER */}
@@ -388,9 +390,15 @@ const PermissionSetDiff = () => {
           <div className="flex flex-col flex-1 bg-[#1e1e1e]">
             <div className="flex justify-between items-center p-4 bg-[#252526] border-b border-gray-700">
               <h2 className="text-lg font-bold text-gray-200">{totalChanges} Conflicts Left</h2>
+              
               <label className="flex items-center space-x-2 cursor-pointer bg-[#1e1e1e] border border-gray-700 px-3 py-1.5 rounded hover:bg-gray-800 transition">
-                <input type="checkbox" checked={showUnchanged} onChange={() => setShowUnchanged(!showUnchanged)} className="w-4 h-4 rounded accent-blue-600 bg-gray-800 border-gray-600" />
-                <span className="font-medium text-sm text-gray-300">Show Context ({unchangedCount})</span>
+                <input 
+                  type="checkbox" 
+                  checked={showOnlyDifferences} 
+                  onChange={() => setShowOnlyDifferences(!showOnlyDifferences)} 
+                  className="w-4 h-4 rounded accent-blue-600 bg-gray-800 border-gray-600" 
+                />
+                <span className="font-medium text-sm text-gray-300">Show only differences</span>
               </label>
             </div>
 
