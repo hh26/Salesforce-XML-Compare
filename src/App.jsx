@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { List } from 'react-window';
 
 // --- DEDICATED CODE PANE COMPONENT ---
 const CodePane = ({ text, side, isPlaceholder, isAdded, isRemoved, isModified, onChange, onMergeBlock, onMergeLine }) => {
@@ -65,6 +66,12 @@ const PermissionSetDiff = () => {
   const [modeB, setModeB] = useState('upload'); 
   const [pasteA, setPasteA] = useState('');
   const [pasteB, setPasteB] = useState('');
+  const [isComparing, setIsComparing] = useState(false);
+  const [isFiltering, setIsFiltering] = useState(false); // NEW
+
+  // NEW: Direct DOM references for the text areas to bypass React's render cycle during pasting
+  const textAreaARef = useRef(null);
+  const textAreaBRef = useRef(null);
   
   const [diffResults, setDiffResults] = useState([]);
   
@@ -210,15 +217,24 @@ const PermissionSetDiff = () => {
 
     diff.push({ category: 'Root Wrapper', name: 'File Footer', status: 'Unchanged', before: `</${parsedA.meta.rootTagName}>`, after: `</${parsedB.meta.rootTagName}>` });
 
-    setDiffResults(diff);
+    // Cache all heavy calculations right now before passing them to the UI
+    const enrichedDiff = diff.map(enrichDiffResult);
+    setDiffResults(enrichedDiff);
   };
 
   const handleCompare = async () => {
-    const textA = modeA === 'upload' ? (fileA ? await fileA.text() : '') : pasteA;
-    const textB = modeB === 'upload' ? (fileB ? await fileB.text() : '') : pasteB;
+    const textA = modeA === 'upload' ? (fileA ? await fileA.text() : '') : (textAreaARef.current ? textAreaARef.current.value : pasteA);
+    const textB = modeB === 'upload' ? (fileB ? await fileB.text() : '') : (textAreaBRef.current ? textAreaBRef.current.value : pasteB);
 
     if (!textA || !textB) return alert("Please provide XML content for both A and B!");
 
+    // 1. Turn on the spinner
+    setIsComparing(true);
+
+    // 2. YIELD THE THREAD! This gives the browser 50ms to physically draw the spinner on screen
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    // 3. Do the heavy lifting
     setPasteA(textA);
     setPasteB(textB);
     setModeA('paste');
@@ -226,6 +242,9 @@ const PermissionSetDiff = () => {
 
     historyRef.current = [];
     generateDiff(textA, textB);
+    
+    // 4. Turn off the spinner
+    setIsComparing(false);
   };
 
   const reconstructXML = (category, keyName, valObj) => {
@@ -268,47 +287,106 @@ const PermissionSetDiff = () => {
     generateDiff(newFullA, newFullB);
   };
 
+  const enrichDiffResult = (res) => {
+    const textA = res.overrideTextA !== undefined ? res.overrideTextA : reconstructXML(res.category, res.name, res.before);
+    const textB = res.overrideTextB !== undefined ? res.overrideTextB : reconstructXML(res.category, res.name, res.after);
+    const linesA = res.status === 'Added' ? 1 : textA.split('\n').length;
+    const linesB = res.status === 'Removed' ? 1 : textB.split('\n').length;
+
+    res.cachedTextA = textA;
+    res.cachedTextB = textB;
+    res.maxLines = Math.max(linesA, linesB);
+    return res;
+  };
+
   const handleMergeBlock = (globalIdx, direction) => {
-    applyChangeAndRecompare((idx, textA, textB) => {
-      if (idx === globalIdx) {
-        return direction === 'AtoB' ? { textA, textB: textA } : { textA: textB, textB };
-      }
-      return null;
-    });
+    saveToHistory();
+    const newDiff = [...diffResults];
+    const result = {...newDiff[globalIdx]}; // Shallow clone the specific block
+
+    let textA = result.overrideTextA !== undefined ? result.overrideTextA : reconstructXML(result.category, result.name, result.before);
+    let textB = result.overrideTextB !== undefined ? result.overrideTextB : reconstructXML(result.category, result.name, result.after);
+
+    if (direction === 'AtoB') {
+      result.overrideTextB = textA;
+      result.overrideTextA = textA;
+    } else {
+      result.overrideTextA = textB;
+      result.overrideTextB = textB; 
+    }
+
+    // Instantly mark as unchanged if they match, without running the heavy XML parser!
+    if (result.overrideTextA === result.overrideTextB) result.status = 'Unchanged';
+    
+    newDiff[globalIdx] = enrichDiffResult(result);
+    setDiffResults(newDiff);
+    
+    // We update pasteA and pasteB silently in the background for the "Save to Disk" button
+    updateSilentSourceOfTruth(newDiff);
   };
 
   const handleMergeLine = (globalIdx, lineIdx, direction) => {
-    applyChangeAndRecompare((idx, textA, textB) => {
-      if (idx === globalIdx) {
-        let arrA = textA ? textA.split('\n') : [];
-        let arrB = textB ? textB.split('\n') : [];
-        
-        const maxLen = Math.max(arrA.length, arrB.length);
-        while(arrA.length < maxLen) arrA.push('');
-        while(arrB.length < maxLen) arrB.push('');
+    saveToHistory();
+    const newDiff = [...diffResults];
+    const result = {...newDiff[globalIdx]};
 
-        if (direction === 'AtoB') {
-          arrB[lineIdx] = arrA[lineIdx];
-          textB = arrB.filter(l => l !== undefined && l !== '').join('\n');
-        } else {
-          arrA[lineIdx] = arrB[lineIdx];
-          textA = arrA.filter(l => l !== undefined && l !== '').join('\n');
-        }
-        return { textA, textB };
-      }
-      return null;
-    });
+    let textA = result.overrideTextA !== undefined ? result.overrideTextA : reconstructXML(result.category, result.name, result.before);
+    let textB = result.overrideTextB !== undefined ? result.overrideTextB : reconstructXML(result.category, result.name, result.after);
+
+    let arrA = textA ? textA.split('\n') : [];
+    let arrB = textB ? textB.split('\n') : [];
+    
+    const maxLen = Math.max(arrA.length, arrB.length);
+    while(arrA.length < maxLen) arrA.push('');
+    while(arrB.length < maxLen) arrB.push('');
+
+    if (direction === 'AtoB') {
+      arrB[lineIdx] = arrA[lineIdx];
+      result.overrideTextB = arrB.filter(l => l !== undefined && l !== '').join('\n');
+      result.overrideTextA = textA; 
+    } else {
+      arrA[lineIdx] = arrB[lineIdx];
+      result.overrideTextA = arrA.filter(l => l !== undefined && l !== '').join('\n');
+      result.overrideTextB = textB;
+    }
+
+    if (result.overrideTextA === result.overrideTextB) result.status = 'Unchanged';
+    
+    newDiff[globalIdx] = enrichDiffResult(result);
+    setDiffResults(newDiff);
+    updateSilentSourceOfTruth(newDiff);
   };
 
   const handleTextEdit = (globalIdx, side, newText) => {
-    applyChangeAndRecompare((idx, textA, textB) => {
-      if (idx === globalIdx) {
-        if (side === 'A') textA = newText;
-        if (side === 'B') textB = newText;
-        return { textA, textB };
-      }
-      return null;
+    saveToHistory();
+    const newDiff = [...diffResults];
+    const result = {...newDiff[globalIdx]};
+
+    if (side === 'A') result.overrideTextA = newText;
+    if (side === 'B') result.overrideTextB = newText;
+
+    let textAToCheck = result.overrideTextA !== undefined ? result.overrideTextA : reconstructXML(result.category, result.name, result.before);
+    let textBToCheck = result.overrideTextB !== undefined ? result.overrideTextB : reconstructXML(result.category, result.name, result.after);
+    
+    if (textAToCheck === textBToCheck) result.status = 'Unchanged';
+
+    newDiff[globalIdx] = enrichDiffResult(result);
+    setDiffResults(newDiff);
+    updateSilentSourceOfTruth(newDiff);
+  };
+
+  // Helper function to keep our export files updated without triggering a re-parse
+  const updateSilentSourceOfTruth = (currentDiffState) => {
+    const linesFullA = [];
+    const linesFullB = [];
+    currentDiffState.forEach(res => {
+      let textA = res.overrideTextA !== undefined ? res.overrideTextA : reconstructXML(res.category, res.name, res.before);
+      let textB = res.overrideTextB !== undefined ? res.overrideTextB : reconstructXML(res.category, res.name, res.after);
+      if (textA && textA !== '') linesFullA.push(textA);
+      if (textB && textB !== '') linesFullB.push(textB);
     });
+    setPasteA(linesFullA.join('\n'));
+    setPasteB(linesFullB.join('\n'));
   };
 
   const copyFullFile = (side) => {
@@ -320,6 +398,105 @@ const PermissionSetDiff = () => {
   const totalChanges = diffResults.filter(d => d.status !== 'Unchanged').length;
   
   const displayedResults = showOnlyDifferences ? diffResults.filter(r => r.status !== 'Unchanged') : diffResults;
+
+  const handleToggleDifferences = async () => {
+    // 1. Turn on the spinner
+    setIsFiltering(true);
+    
+    // 2. Yield the thread to paint the screen
+    await new Promise(resolve => setTimeout(resolve, 50));
+    
+    // 3. Do the heavy filtering
+    setShowOnlyDifferences(prev => !prev);
+    
+    // 4. Turn off the spinner
+    setIsFiltering(false);
+  };
+
+  // 🔥 This stops React from destroying and rebuilding the rows on every keystroke!
+  const renderRow = useCallback(({ index, style }) => {
+    const result = displayedResults[index];
+    const globalIdx = diffResults.indexOf(result);
+    const isAdded = result.status === 'Added';
+    const isRemoved = result.status === 'Removed';
+    const isModified = result.status === 'Modified';
+    const isUnchanged = result.status === 'Unchanged';
+
+    const textA = result.cachedTextA;
+    const textB = result.cachedTextB;
+    const maxLines = result.maxLines;
+    
+    const linesA = isAdded ? [''] : textA.split('\n');
+    const linesB = isRemoved ? [''] : textB.split('\n');
+    
+    const renderA = [...linesA];
+    const renderB = [...linesB];
+    while(renderA.length < maxLines) renderA.push('');
+    while(renderB.length < maxLines) renderB.push('');
+
+    const bgA = isRemoved ? 'bg-red-950/40 text-red-200' : isModified ? 'bg-yellow-950/30 text-yellow-100' : isAdded ? 'text-gray-600 italic' : 'text-[#d4d4d4]';
+    const bgB = isAdded ? 'bg-green-950/30 text-green-200' : isModified ? 'bg-yellow-950/30 text-yellow-200' : isRemoved ? 'text-gray-600 italic' : 'text-[#d4d4d4]';
+
+    return (
+      <div style={style} className="flex flex-col w-full border-b border-gray-800/80 overflow-hidden">
+        {!isUnchanged && result.category !== 'Root Wrapper' && (
+          <div className="flex w-full bg-[#1e1e1e] border-b border-gray-800 text-[10px] text-gray-500 uppercase tracking-widest h-[24px]">
+              <div className="w-[46%] px-4 py-1 border-r border-gray-800 text-right">
+                  <button onClick={() => handleMergeBlock(globalIdx, 'AtoB')} className="hover:text-green-400 font-bold px-2 py-0.5 rounded hover:bg-gray-800 transition">Push Block ➔</button>
+              </div>
+              <div className="w-[8%] border-r border-gray-800 bg-[#252526]"></div>
+              <div className="w-[46%] px-4 py-1">
+                  <button onClick={() => handleMergeBlock(globalIdx, 'BtoA')} className="hover:text-blue-400 font-bold px-2 py-0.5 rounded hover:bg-gray-800 transition">⬅ Pull Block</button>
+              </div>
+          </div>
+        )}
+
+        {editingBlock.idx === globalIdx ? (
+          <div className="flex w-full flex-1">
+             <div className={`w-[46%] border-r border-gray-700 ${bgA}`}>
+               {editingBlock.side === 'A' && !isAdded ? (
+                  <textarea autoFocus className="w-full h-full bg-[#062f4a] text-[#d4d4d4] outline-none resize-none p-2 font-mono text-sm border border-blue-500" defaultValue={textA} onBlur={(e) => { setEditingBlock({ idx: null, side: null }); handleTextEdit(globalIdx, 'A', e.target.value); }}/>
+               ) : (
+                  <div className="p-2 whitespace-pre-wrap break-all">{textA}</div>
+               )}
+             </div>
+             <div className="w-[8%] bg-[#252526] border-r border-gray-700"></div>
+             <div className={`w-[46%] ${bgB}`}>
+               {editingBlock.side === 'B' && !isRemoved ? (
+                  <textarea autoFocus className="w-full h-full bg-[#062f4a] text-[#d4d4d4] outline-none resize-none p-2 font-mono text-sm border border-blue-500" defaultValue={textB} onBlur={(e) => { setEditingBlock({ idx: null, side: null }); handleTextEdit(globalIdx, 'B', e.target.value); }}/>
+               ) : (
+                  <div className="p-2 whitespace-pre-wrap break-all">{textB}</div>
+               )}
+             </div>
+          </div>
+        ) : (
+          <div className="flex flex-col w-full flex-1">
+            {Array.from({length: maxLines}, (_, i) => {
+               const showRight = renderA[i] && renderA[i] !== renderB[i] && !isAdded && !isRemoved;
+               const showLeft = renderB[i] && renderA[i] !== renderB[i] && !isAdded && !isRemoved;
+
+               return (
+                 <div key={i} className="flex w-full hover:bg-white/5 transition-colors group h-[24px]">
+                   <div className={`w-[46%] px-4 border-r border-gray-700 truncate ${!isAdded ? 'cursor-text' : ''} ${bgA}`} onClick={() => { if(!isAdded) setEditingBlock({ idx: globalIdx, side: 'A' })}}>
+                      {renderA[i]}
+                   </div>
+                   
+                   <div className="w-[8%] border-r border-gray-700 bg-[#252526] flex justify-center items-start pt-0.5 gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                      {showRight && <button onClick={() => handleMergeLine(globalIdx, i, 'AtoB')} className="text-gray-500 hover:text-green-400 font-bold px-1 rounded hover:bg-gray-800">➔</button>}
+                      {showLeft && <button onClick={() => handleMergeLine(globalIdx, i, 'BtoA')} className="text-gray-500 hover:text-blue-400 font-bold px-1 rounded hover:bg-gray-800">⬅</button>}
+                   </div>
+
+                   <div className={`w-[46%] px-4 truncate ${!isRemoved ? 'cursor-text' : ''} ${bgB}`} onClick={() => { if(!isRemoved) setEditingBlock({ idx: globalIdx, side: 'B' })}}>
+                      {renderB[i]}
+                   </div>
+                 </div>
+               );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  }, [displayedResults, diffResults, editingBlock]); // <-- Correctly closed renderRow function
 
   return (
     <div className="min-h-screen bg-[#111111] p-4 md:p-8 font-sans text-[#d4d4d4]">
@@ -350,7 +527,12 @@ const PermissionSetDiff = () => {
                 <span className="text-sm font-mono text-gray-400 truncate flex-1">{fileA ? fileA.name : "No file chosen..."}</span>
               </div>
             ) : (
-              <textarea className="w-full h-32 p-3 border border-gray-700 rounded bg-[#1e1e1e] text-xs font-mono text-[#d4d4d4] resize-y outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-colors placeholder-gray-600" placeholder="Paste original XML here..." value={pasteA} onChange={(e) => setPasteA(e.target.value)} />
+              <textarea 
+                ref={textAreaARef}
+                defaultValue={pasteA} 
+                className="w-full h-32 p-3 border border-gray-700 rounded bg-[#1e1e1e] text-xs font-mono text-[#d4d4d4] resize-y outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-colors placeholder-gray-600" 
+                placeholder="Paste original XML here..." 
+              />
             )}
           </div>
           
@@ -372,15 +554,32 @@ const PermissionSetDiff = () => {
                 <span className="text-sm font-mono text-gray-400 truncate flex-1">{fileB ? fileB.name : "No file chosen..."}</span>
               </div>
             ) : (
-              <textarea className="w-full h-32 p-3 border border-gray-700 rounded bg-[#1e1e1e] text-xs font-mono text-[#d4d4d4] resize-y outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-colors placeholder-gray-600" placeholder="Paste modified XML here..." value={pasteB} onChange={(e) => setPasteB(e.target.value)} />
+              <textarea 
+                ref={textAreaBRef}
+                defaultValue={pasteB} 
+                className="w-full h-32 p-3 border border-gray-700 rounded bg-[#1e1e1e] text-xs font-mono text-[#d4d4d4] resize-y outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-colors placeholder-gray-600" 
+                placeholder="Paste modified XML here..." 
+              />
             )}
           </div>
         </div>
 
         {/* COMPARE BUTTON & UNDO HINT */}
         <div className="text-center bg-[#1e1e1e] pb-8 border-b border-gray-800 flex flex-col items-center gap-3">
-          <button onClick={handleCompare} className="bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 px-12 rounded transition shadow-lg text-lg border border-blue-500 tracking-wide">
-            Compare & Merge
+          <button 
+            onClick={handleCompare} 
+            disabled={isComparing}
+            className={`${isComparing ? 'bg-blue-800 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-500'} text-white font-bold py-3 px-12 rounded transition shadow-lg text-lg border border-blue-500 tracking-wide flex items-center gap-3`}
+          >
+            {isComparing ? (
+              <>
+                <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                Processing 90k+ Lines...
+              </>
+            ) : "Compare & Merge"}
           </button>
           <span className="text-gray-500 text-xs tracking-wide">⌨️ Pro Tip: Use <kbd className="bg-[#252526] border border-gray-700 px-1.5 py-0.5 rounded text-gray-300 shadow-sm">Ctrl + Z</kbd> to Undo any merge action</span>
         </div>
@@ -391,15 +590,28 @@ const PermissionSetDiff = () => {
             <div className="flex justify-between items-center p-4 bg-[#252526] border-b border-gray-700">
               <h2 className="text-lg font-bold text-gray-200">{totalChanges} Conflicts Left</h2>
               
-              <label className="flex items-center space-x-2 cursor-pointer bg-[#1e1e1e] border border-gray-700 px-3 py-1.5 rounded hover:bg-gray-800 transition">
-                <input 
-                  type="checkbox" 
-                  checked={showOnlyDifferences} 
-                  onChange={() => setShowOnlyDifferences(!showOnlyDifferences)} 
-                  className="w-4 h-4 rounded accent-blue-600 bg-gray-800 border-gray-600" 
-                />
-                <span className="font-medium text-sm text-gray-300">Show only differences</span>
-              </label>
+              <button 
+                onClick={handleToggleDifferences}
+                disabled={isFiltering}
+                className={`flex items-center space-x-2 px-3 py-1.5 rounded transition border border-gray-700 ${isFiltering ? 'bg-[#252526] opacity-70 cursor-wait' : 'bg-[#1e1e1e] hover:bg-gray-800 cursor-pointer'}`}
+              >
+                {isFiltering ? (
+                  <svg className="animate-spin h-4 w-4 text-blue-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                ) : (
+                  <input 
+                    type="checkbox" 
+                    checked={showOnlyDifferences} 
+                    readOnly 
+                    className="w-4 h-4 rounded accent-blue-600 bg-gray-800 border-gray-600 pointer-events-none" 
+                  />
+                )}
+                <span className="font-medium text-sm text-gray-300">
+                  {isFiltering ? 'Filtering Data...' : 'Show only differences'}
+                </span>
+              </button>
             </div>
 
             <div className="bg-[#1e1e1e] text-[#d4d4d4] font-mono text-sm flex flex-col">
@@ -416,96 +628,13 @@ const PermissionSetDiff = () => {
                 </div>
               </div>
 
-              <div className="flex flex-col pb-10">
-                {displayedResults.map((result, idx) => {
-                  const globalIdx = diffResults.indexOf(result);
-                  const isAdded = result.status === 'Added';
-                  const isRemoved = result.status === 'Removed';
-                  const isModified = result.status === 'Modified';
-                  const isUnchanged = result.status === 'Unchanged';
-
-                  const textA = result.overrideTextA !== undefined ? result.overrideTextA : reconstructXML(result.category, result.name, result.before);
-                  const textB = result.overrideTextB !== undefined ? result.overrideTextB : reconstructXML(result.category, result.name, result.after);
-                  
-                  const linesA = isAdded ? [''] : textA.split('\n');
-                  const linesB = isRemoved ? [''] : textB.split('\n');
-                  const maxLines = Math.max(linesA.length, linesB.length);
-                  
-                  const renderA = [...linesA];
-                  const renderB = [...linesB];
-                  while(renderA.length < maxLines) renderA.push('');
-                  while(renderB.length < maxLines) renderB.push('');
-
-                  const bgA = isRemoved ? 'bg-red-950/40 text-red-200' : isModified ? 'bg-yellow-950/30 text-yellow-100' : isAdded ? 'text-gray-600 italic' : 'text-[#d4d4d4]';
-                  const bgB = isAdded ? 'bg-green-950/30 text-green-200' : isModified ? 'bg-yellow-950/30 text-yellow-200' : isRemoved ? 'text-gray-600 italic' : 'text-[#d4d4d4]';
-
-                  return (
-                    <div key={globalIdx} className="flex flex-col w-full border-b border-gray-800/80">
-                      
-                      {!isUnchanged && result.category !== 'Root Wrapper' && (
-                        <div className="flex w-full bg-[#1e1e1e] border-b border-gray-800 text-[10px] text-gray-500 uppercase tracking-widest">
-                            <div className="w-[46%] px-4 py-1 border-r border-gray-800 text-right">
-                                <button onClick={() => handleMergeBlock(globalIdx, 'AtoB')} className="hover:text-green-400 font-bold px-2 py-0.5 rounded hover:bg-gray-800 transition">Push Block ➔</button>
-                            </div>
-                            <div className="w-[8%] border-r border-gray-800 bg-[#252526]"></div>
-                            <div className="w-[46%] px-4 py-1">
-                                <button onClick={() => handleMergeBlock(globalIdx, 'BtoA')} className="hover:text-blue-400 font-bold px-2 py-0.5 rounded hover:bg-gray-800 transition">⬅ Pull Block</button>
-                            </div>
-                        </div>
-                      )}
-
-                      {editingBlock.idx === globalIdx ? (
-                        <div className="flex w-full">
-                           <div className={`w-[46%] border-r border-gray-700 ${bgA}`}>
-                             {editingBlock.side === 'A' && !isAdded ? (
-                                <textarea autoFocus className="w-full h-full min-h-[60px] bg-[#062f4a] text-[#d4d4d4] outline-none resize-y p-2 font-mono text-sm border border-blue-500" defaultValue={textA} onBlur={(e) => { setEditingBlock({ idx: null, side: null }); handleTextEdit(globalIdx, 'A', e.target.value); }}/>
-                             ) : (
-                                <div className="p-2 whitespace-pre-wrap break-all">{textA}</div>
-                             )}
-                           </div>
-                           <div className="w-[8%] bg-[#252526] border-r border-gray-700"></div>
-                           <div className={`w-[46%] ${bgB}`}>
-                             {editingBlock.side === 'B' && !isRemoved ? (
-                                <textarea autoFocus className="w-full h-full min-h-[60px] bg-[#062f4a] text-[#d4d4d4] outline-none resize-y p-2 font-mono text-sm border border-blue-500" defaultValue={textB} onBlur={(e) => { setEditingBlock({ idx: null, side: null }); handleTextEdit(globalIdx, 'B', e.target.value); }}/>
-                             ) : (
-                                <div className="p-2 whitespace-pre-wrap break-all">{textB}</div>
-                             )}
-                           </div>
-                        </div>
-                      ) : (
-                        <div className="flex flex-col w-full py-2">
-                          {Array.from({length: maxLines}, (_, i) => {
-                             const showRight = renderA[i] && renderA[i] !== renderB[i] && !isAdded && !isRemoved;
-                             const showLeft = renderB[i] && renderA[i] !== renderB[i] && !isAdded && !isRemoved;
-
-                             return (
-                               <div key={i} className="flex w-full hover:bg-white/5 transition-colors group min-h-[24px]">
-                                 <div 
-                                    className={`w-[46%] px-4 border-r border-gray-700 break-all whitespace-pre-wrap ${!isAdded ? 'cursor-text' : ''} ${bgA}`}
-                                    onClick={() => { if(!isAdded) setEditingBlock({ idx: globalIdx, side: 'A' })}}
-                                 >
-                                    {renderA[i]}
-                                 </div>
-                                 
-                                 <div className="w-[8%] border-r border-gray-700 bg-[#252526] flex justify-center items-start pt-0.5 gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                                    {showRight && <button onClick={() => handleMergeLine(globalIdx, i, 'AtoB')} title="Push Line Right" className="text-gray-500 hover:text-green-400 font-bold px-1 rounded hover:bg-gray-800">➔</button>}
-                                    {showLeft && <button onClick={() => handleMergeLine(globalIdx, i, 'BtoA')} title="Push Line Left" className="text-gray-500 hover:text-blue-400 font-bold px-1 rounded hover:bg-gray-800">⬅</button>}
-                                 </div>
-
-                                 <div 
-                                    className={`w-[46%] px-4 break-all whitespace-pre-wrap ${!isRemoved ? 'cursor-text' : ''} ${bgB}`}
-                                    onClick={() => { if(!isRemoved) setEditingBlock({ idx: globalIdx, side: 'B' })}}
-                                 >
-                                    {renderB[i]}
-                                 </div>
-                               </div>
-                             );
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
+              <div className="flex flex-col flex-1 h-[70vh]"> 
+                <List
+                  rowCount={displayedResults.length}
+                  rowProps={{ displayedResults, diffResults, editingBlock }}
+                  rowHeight={(index) => (displayedResults[index].maxLines * 24) + 40}
+                  rowComponent={renderRow} 
+                />
               </div>
 
             </div>
